@@ -1,0 +1,434 @@
+# .gitignore
+env/
+__pycache__/
+*.pyc
+.env
+mongo_data/
+.DS_Store
+```
+```env
+# .env.example
+MONGO_URI=mongodb://mongo:27017/nextgen
+SESSION_SECRET=your-very-secret-session-key
+ENCRYPTION_KEY=your-base64-encoded-fernet-key
+ACCESS_TOKEN_EXPIRE_MINUTES=60
+RATE_LIMIT=5/minute
+```
+```markdown
+# README.md
+
+## NextGen Social Network Backend
+
+### Prérequis
+- Docker & Docker Compose
+- Python 3.11
+
+### Installation
+1. Copier `.env.example` en `.env` et compléter les secrets.
+2. Construire et lancer :
+   ```bash
+docker-compose up --build -d
+```
+3. Lancer en local sans Docker :
+   ```bash
+pip install -r requirements.txt
+uvicorn app.main:app --reload
+```
+
+### Endpoints principaux
+- **POST** `/auth/register` : Créer un compte
+- **POST** `/auth/login` : Obtenir un JWT
+- **GET** `/posts?limit=50` : Lister les posts (pagination)
+- **POST** `/posts` : Créer un post (JWT)
+- **POST** `/posts/{id}/like` : Liker un post (JWT)
+- **POST** `/comments/{post_id}` : Ajouter un commentaire (JWT)
+- **WS** `/ws/feed` : WebSocket broadcast des nouveaux posts
+```
+```yaml
+# docker-compose.yml
+version: '3.8'
+services:
+  web:
+    build: .
+    ports:
+      - '8000:8000'
+    env_file: .env
+    depends_on:
+      - mongo
+  mongo:
+    image: mongo:6.0
+    volumes:
+      - mongo_data:/data/db
+volumes:
+  mongo_data:
+```
+```dockerfile
+# Dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+```txt
+# requirements.txt
+fastapi
+uvicorn[standard]
+pydantic
+motor
+passlib[bcrypt]
+python-jose
+cryptography
+slowapi
+python-dotenv
+```
+```python
+# app/main.py
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
+from app.db.mongo import init_db
+from app.core.config import settings
+from app.routers import auth, posts, comments, feed_ws
+import logging
+from app.core.logging import setup_logging
+
+# Logging
+setup_logging()
+logger = logging.getLogger(__name__)
+
+# Rate limiter
+limiter = Limiter(key_func=get_remote_address, default_limits=[settings.RATE_LIMIT])
+
+app = FastAPI(title=settings.PROJECT_NAME, version=settings.VERSION)
+app.state.limiter = limiter
+app.add_exception_handler(429, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+# CORS (optional)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def on_startup():
+    logger.info("Initializing database indexes...")
+    await init_db()
+
+# Routers
+app.include_router(auth.router, prefix="/auth", tags=["auth"])
+app.include_router(posts.router, prefix="/posts", tags=["posts"])
+app.include_router(comments.router, prefix="/comments", tags=["comments"])
+app.include_router(feed_ws.router, prefix="/ws", tags=["feed"])
+
+@app.middleware("http")
+@limiter.limit(settings.RATE_LIMIT)
+async def rate_limit(request: Request, call_next):
+    return await call_next(request)
+```
+```python
+# app/core/config.py
+from pydantic import BaseSettings, Field
+
+class Settings(BaseSettings):
+    PROJECT_NAME: str = "NextGen Social Network"
+    VERSION: str = "1.0.0"
+    MONGO_URI: str
+    SESSION_SECRET: str
+    ENCRYPTION_KEY: str = Field(..., env="ENCRYPTION_KEY")
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+    RATE_LIMIT: str = "5/minute"
+
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+```
+```python
+# app/core/logging.py
+import logging
+
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    )
+```
+```python
+# app/core/security.py
+from passlib.context import CryptContext
+from fastapi.security import OAuth2PasswordBearer
+from datetime import datetime, timedelta
+from jose import jwt, JWTError
+from app.core.config import settings
+from fastapi import HTTPException, status
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+
+def create_access_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, settings.SESSION_SECRET, algorithm="HS256")
+
+
+def decode_access_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, settings.SESSION_SECRET, algorithms=["HS256"])
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+```
+```python
+# app/core/managers.py
+from cryptography.fernet import Fernet
+from app.core.config import settings
+import base64
+
+# Ensure ENCRYPTION_KEY is base64-encoded 32-byte
+key = base64.urlsafe_b64decode(settings.ENCRYPTION_KEY)
+fernet = Fernet(key)
+
+class EncryptionManager:
+    @staticmethod
+    def encrypt(data: str) -> bytes:
+        return fernet.encrypt(data.encode())
+
+    @staticmethod
+    def decrypt(token: bytes) -> str:
+        return fernet.decrypt(token).decode()
+```
+```python
+# app/db/mongo.py
+from motor.motor_asyncio import AsyncIOMotorClient
+from app.core.config import settings
+
+client = AsyncIOMotorClient(settings.MONGO_URI)
+db = client[settings.PROJECT_NAME.replace(' ', '_').lower()]
+
+async def init_db():
+    await db.users.create_index("email", unique=True)
+    await db.posts.create_index([("timestamp", -1)])
+    await db.comments.create_index("post_id")
+```
+```python
+# app/models/schemas.py
+from pydantic import BaseModel, EmailStr, Field
+from datetime import datetime
+from typing import List
+
+class UserIn(BaseModel):
+    email: EmailStr
+    password: str
+
+class UserOut(BaseModel):
+    id: str
+    email: EmailStr
+    created_at: datetime
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = 'bearer'
+
+class PostIn(BaseModel):
+    content: str = Field(..., max_length=280)
+
+class PostOut(BaseModel):
+    id: str
+    author_id: str
+    content: str
+    timestamp: datetime
+    likes: int
+    comments: int
+
+class CommentIn(BaseModel):
+    content: str = Field(..., max_length=280)
+
+class CommentOut(BaseModel):
+    id: str
+    post_id: str
+    author_id: str
+    content: str
+    timestamp: datetime
+```
+```python
+# app/services/auth_service.py
+from app.db.mongo import db
+from app.models.schemas import UserIn, UserOut
+from app.core.security import get_password_hash, verify_password, create_access_token
+from datetime import datetime
+from fastapi import HTTPException, status
+
+async def register_user(user: UserIn) -> UserOut:
+    if await db.users.find_one({"email": user.email}):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Email already registered")
+    hashed = get_password_hash(user.password)
+    doc = {"email": user.email, "password": hashed, "created_at": datetime.utcnow()}
+    res = await db.users.insert_one(doc)
+    return UserOut(id=str(res.inserted_id), email=user.email, created_at=doc["created_at"])
+
+async def authenticate_user(email: str, password: str) -> str:
+    doc = await db.users.find_one({"email": email})
+    if not doc or not verify_password(password, doc["password"]):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    token = create_access_token({"user_id": str(doc["_id"])})
+    return token
+```
+```python
+# app/services/post_service.py
+from app.db.mongo import db
+from app.models.schemas import PostIn, PostOut
+from app.core.managers import EncryptionManager
+from datetime import datetime
+from bson import ObjectId
+from fastapi import BackgroundTasks
+from app.routers.feed_ws import broadcast
+
+async def create_post(author_id: str, data: PostIn, background_tasks: BackgroundTasks) -> PostOut:
+    encrypted = EncryptionManager.encrypt(data.content)
+    doc = {"author_id": author_id, "content": encrypted, "timestamp": datetime.utcnow(), "likes": 0, "comments": 0}
+    res = await db.posts.insert_one(doc)
+    post = PostOut(id=str(res.inserted_id), author_id=author_id, content=data.content, timestamp=doc["timestamp"], likes=0, comments=0)
+    background_tasks.add_task(broadcast, f"new_post:{post.id}")
+    return post
+
+async def list_posts(limit: int = 100) -> list[PostOut]:
+    cursor = db.posts.find().sort("timestamp", -1).limit(limit)
+    out = []
+    async for d in cursor:
+        try:
+            content = EncryptionManager.decrypt(d["content"])
+        except:
+            content = "[Encrypted]"
+        out.append(PostOut(id=str(d["_id"]), author_id=d["author_id"], content=content, timestamp=d["timestamp"], likes=d["likes"], comments=d["comments"]))
+    return out
+
+async def like_post(post_id: str) -> dict:
+    res = await db.posts.update_one({"_id": ObjectId(post_id)}, {"$inc": {"likes": 1}})
+    if res.matched_count == 0:
+        from fastapi import HTTPException, status
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Post not found")
+    return {"message": "Liked"}
+```
+```python
+# app/services/comment_service.py
+from app.db.mongo import db
+from app.models.schemas import CommentIn, CommentOut
+from fastapi import HTTPException, status
+from datetime import datetime
+from bson import ObjectId
+
+async def add_comment(post_id: str, user_id: str, data: CommentIn) -> CommentOut:
+    if not await db.posts.find_one({"_id": ObjectId(post_id)}):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Post not found")
+    doc = {"post_id": post_id, "author_id": user_id, "content": data.content, "timestamp": datetime.utcnow()}
+    res = await db.comments.insert_one(doc)
+    await db.posts.update_one({"_id": ObjectId(post_id)}, {"$inc": {"comments": 1}})
+    return CommentOut(id=str(res.inserted_id), post_id=post_id, author_id=user_id, content=data.content, timestamp=doc["timestamp"])
+```
+```python
+# app/routers/auth.py
+from fastapi import APIRouter, Depends
+from fastapi.security import OAuth2PasswordRequestForm
+from app.models.schemas import UserIn, UserOut, Token
+from app.services.auth_service import register_user, authenticate_user
+
+router = APIRouter()
+
+@router.post("/register", response_model=UserOut)
+async def register(u: UserIn):
+    return await register_user(u)
+
+@router.post("/login", response_model=Token)
+async def login(form: OAuth2PasswordRequestForm = Depends()):
+    token = await authenticate_user(form.username, form.password)
+    return Token(access_token=token)
+```
+```python
+# app/routers/posts.py
+from fastapi import APIRouter, Depends, Query, BackgroundTasks, HTTPException
+from typing import List
+from app.models.schemas import PostIn, PostOut
+from app.services.post_service import create_post, list_posts, like_post
+from app.core.security import oauth2_scheme, decode_access_token
+
+router = APIRouter()
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
+    data = decode_access_token(token)
+    if not data or "user_id" not in data:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return data["user_id"]
+
+@router.get("/", response_model=List[PostOut])
+async def read_posts(limit: int = Query(100, le=500)):
+    return await list_posts(limit)
+
+@router.post("/", response_model=PostOut)
+async def write_post(p: PostIn, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user)):
+    return await create_post(user_id, p, background_tasks)
+
+@router.post("/{post_id}/like")
+async def like(post_id: str, user_id: str = Depends(get_current_user)):
+    return await like_post(post_id)
+```
+```python
+# app/routers/comments.py
+from fastapi import APIRouter, Depends
+from app.models.schemas import CommentIn, CommentOut
+from app.services.comment_service import add_comment
+from app.core.security import oauth2_scheme, decode_access_token
+from fastapi import HTTPException
+
+router = APIRouter()
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
+    data = decode_access_token(token)
+    if not data or "user_id" not in data:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return data["user_id"]
+
+@router.post("/{post_id}", response_model=CommentOut)
+async def comment(post_id: str, ci: CommentIn, user_id: str = Depends(get_current_user)):
+    return await add_comment(post_id, user_id, ci)
+```
+```python
+# app/routers/feed_ws.py
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from typing import List
+
+router = APIRouter()
+active_connections: List[WebSocket] = []
+
+async def broadcast(message: str):
+    for conn in active_connections:
+        try:
+            await conn.send_text(message)
+        except:
+            pass
+
+@router.websocket("/feed")
+async def feed(ws: WebSocket):
+    await ws.accept()
+    active_connections.append(ws)
+    try:
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        active_connections.remove(ws)
